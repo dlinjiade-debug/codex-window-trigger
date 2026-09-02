@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'triggers/**'
+      - 'state/**'
+  pull_request:
+    paths-ignore:
+      - 'triggers/**'
+      - 'state/**'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install verified actionlint 1.7.12
+        env:
+          ACTIONLINT_URL: https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$ACTIONLINT_URL"
+          echo "$ACTIONLINT_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          chmod 0755 "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          echo "ACTIONLINT=$RUNNER_TEMP/actionlint" >> "$GITHUB_ENV"
+      - name: Validate workflow schemas
+        run: actionlint -shellcheck= .github/workflows/ci.yml .github/workflows/sentinel.yml
+      - run: python -m unittest discover -s tests -v
+      - run: python -m compileall -q codex_window_trigger scripts tests
+      - run: git diff --check
