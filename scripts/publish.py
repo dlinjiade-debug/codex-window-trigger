@@ -1,7 +1,8 @@
 """Fail-closed orchestration. Only public signal data is ever committed.
 
 The CLI's next-state on a trigger is a *candidate*, never a receipt. We
-persist a new plan against the original state only after observing the PR.
+persist a new plan only after observing both the trusted PR and its exact
+bot-authored Codex delegation comment.
 """
 import argparse
 from datetime import UTC, datetime, timedelta, timezone
@@ -48,6 +49,15 @@ class GitHub:
     def create_pr(self, repository, base, branch, title, body_file):
         return _command(["gh", "pr", "create", "--repo", repository, "--base", base,
                          "--head", branch, "--title", title, "--body-file", str(body_file)])
+
+    def create_issue_comment(self, repository, number, body_file):
+        return json.loads(_command(["gh", "api", "--method", "POST",
+                                   f"repos/{repository}/issues/{number}/comments",
+                                   "--input", str(body_file)]))
+
+    def list_issue_comments(self, repository, number):
+        return json.loads(_command(["gh", "api", "--paginate", "--slurp",
+                                   f"repos/{repository}/issues/{number}/comments?per_page=100"]))
 
 
 def _safe_path(root, relative):
@@ -116,11 +126,27 @@ def _existing(root, repository, github):
                     or not isinstance(base_repo, dict) or head_repo.get("full_name") != repository
                     or base_repo.get("full_name") != repository):
                 continue
-            normalized.append({"title": item.get("title"), "headRefName": head.get("ref"),
+            normalized.append({"number": item.get("number"), "title": item.get("title"),
+                               "headRefName": head.get("ref"),
                                "created_at": item.get("created_at")})
     target = _safe_path(root, ".runtime/prs.json")
     write_json(target, normalized)
     return read_existing_prs(target)
+
+
+def _pr_number(root, key):
+    value = read_json(_safe_path(root, ".runtime/prs.json"))
+    matches = []
+    for item in value:
+        if (isinstance(item, dict) and item.get("title") == f"[codex-5h-touch] {key}"
+                and item.get("headRefName") == f"trigger/{'000000000000' if key == _CANARY else key[:12]}"):
+            number = item.get("number")
+            if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+                raise ValueError("matching trigger PR number is invalid")
+            matches.append(number)
+    if len(matches) != 1:
+        raise ValueError("matching trigger PR number is not unique")
+    return matches[0]
 
 
 def _plan(root, now, fixtures, dry_run):
@@ -194,6 +220,95 @@ def _body(runtime, payload):
     path = runtime / "pr-body.md"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _comment_body(key, created_at):
+    created = parse_utc(created_at.isoformat()).isoformat()
+    return (
+        "@codex Do not inspect files, run commands, modify the repository, create commits, "
+        "or post follow-ups. Reply with exactly the receipt block below and then stop.\n\n"
+        "codex-window-trigger receipt\n"
+        f"key={key}\n"
+        f"pr_created_utc={created}\n"
+        f"warning={WARNING}\n\n"
+        f"<!-- codex-window-trigger:{key} -->\n"
+    )
+
+
+def _comment(runtime, body):
+    path = runtime / "codex-comment.json"
+    write_json(path, {"body": body})
+    return path
+
+
+def _comment_exists(repository, number, expected, github):
+    pages = github.list_issue_comments(repository, number)
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise ValueError("expected all paginated comment pages")
+    matches = 0
+    for page in pages:
+        for item in page:
+            if not isinstance(item, dict):
+                raise ValueError("invalid raw comment")
+            user = item.get("user") or {}
+            if not isinstance(user, dict):
+                raise ValueError("invalid comment identity")
+            if user.get("login") == "github-actions[bot]" and item.get("body") == expected:
+                matches += 1
+    if matches > 1:
+        raise ValueError("duplicate exact trigger comments")
+    return matches == 1
+
+
+def _ensure_comment(runtime, repository, number, key, created_at, github):
+    expected = _comment_body(key, created_at)
+    if _comment_exists(repository, number, expected, github):
+        return False
+    try:
+        github.create_issue_comment(repository, number, _comment(runtime, expected))
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        if not _comment_exists(repository, number, expected, github):
+            raise
+    else:
+        if not _comment_exists(repository, number, expected, github):
+            raise RuntimeError("comment success is not yet observable; retry without persisting candidate")
+    return True
+
+
+def _handled_keys(state):
+    handled = set(state.get("handled_keys", ()))
+    handled.update(key for key, record in state["episodes"].items()
+                   if record["status"] in {"baseline", "triggered"})
+    return handled
+
+
+def _repairable_comments(root, repository, existing, handled, github):
+    missing = []
+    for key, created_at in existing.items():
+        if key in handled:
+            continue
+        number = _pr_number(root, key)
+        if not _comment_exists(repository, number, _comment_body(key, created_at), github):
+            missing.append((key, created_at, number))
+    if len(missing) > 1:
+        raise ValueError("multiple trigger PRs lack an exact Codex comment")
+    return missing
+
+
+def _guard_canary_comments(root, runtime, repository, existing, handled, github):
+    missing = _repairable_comments(root, repository, existing, handled, github)
+    if not missing:
+        return False
+    key, created_at, number = missing[0]
+    if key != _CANARY:
+        raise ValueError("canary approval cannot repair a different trigger PR")
+    return _ensure_comment(runtime, repository, number, key, created_at, github)
+
+
+def _repair_poll_comments(root, runtime, repository, existing, handled, github):
+    for key, created_at, number in _repairable_comments(
+            root, repository, existing, handled, github):
+        _ensure_comment(runtime, repository, number, key, created_at, github)
 
 
 def _remote_branch(root, branch):
@@ -285,11 +400,12 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     runtime = _safe_path(root, ".runtime")
     runtime.mkdir(exist_ok=True)
     for name in ("prs.json", "outputs.txt", "next-state.json", "trigger.json", "pr-title.txt",
-                 "pr-body.md", "decision.json", "recovered-trigger.json"):
+                 "pr-body.md", "codex-comment.json", "decision.json", "recovered-trigger.json"):
         _safe_path(root, f".runtime/{name}")
     now = parse_utc(now.isoformat()) if now is not None else datetime.now(UTC)
     state = read_json(_safe_path(root, "state/state.json"))
     plan_transition(state, None, eligible=False, now=now, existing_prs={})
+    handled = _handled_keys(state)
     if dry_run:
         if operation == "canary":
             return "dry_run"
@@ -301,11 +417,18 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     if operation == "canary" and not state["initialized"]:
         raise ValueError("canary requires initialized state")
     existing = _existing(root, repository, github)
+    if operation == "poll":
+        _repair_poll_comments(root, runtime, repository, existing, handled, github)
+    elif operation == "canary":
+        completed_canary = _guard_canary_comments(
+            root, runtime, repository, existing, handled, github)
+    elif _repairable_comments(root, repository, existing, handled, github):
+        raise ValueError("baseline cannot acknowledge a trigger PR without a Codex comment")
     if operation == "canary":
         if _CANARY in existing:
             reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
             _persist(root, reconciled.next_state, branch)
-            return "skip"
+            return "canary" if completed_canary else "skip"
         payload = {"key": _CANARY, "event_id": _CANARY, "score": None, "target_at": None,
                    "source_url": None, "receipt": {"utc": now.isoformat(),
                        "utc_plus_08": now.astimezone(timezone(timedelta(hours=8))).isoformat()}}
@@ -328,10 +451,18 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     existing = _existing(root, repository, github)
     key = payload["key"]
     if operation == "canary":
+        completed_canary = _guard_canary_comments(
+            root, runtime, repository, existing, handled, github)
+        if _CANARY in existing:
+            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+            _persist(root, reconciled.next_state, branch)
+            return "canary" if completed_canary else "skip"
         reconciled_state, cooling_down = _canary_cooldown(state, existing, now)
         if cooling_down:
             _persist(root, reconciled_state, branch)
             return "skip"
+    else:
+        _repair_poll_comments(root, runtime, repository, existing, handled, github)
     if operation == "poll" and existing != planned_existing:
         reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
         _persist(root, reconciled.next_state, branch)
@@ -340,10 +471,18 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
         payload = _ensure_branch(root, trigger_branch, payload, runtime)
         existing = _existing(root, repository, github)
         if operation == "canary":
+            completed_canary = _guard_canary_comments(
+                root, runtime, repository, existing, handled, github)
+            if _CANARY in existing:
+                reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+                _persist(root, reconciled.next_state, branch)
+                return "canary" if completed_canary else "skip"
             reconciled_state, cooling_down = _canary_cooldown(state, existing, now)
             if cooling_down:
                 _persist(root, reconciled_state, branch)
                 return "skip"
+        else:
+            _repair_poll_comments(root, runtime, repository, existing, handled, github)
         if operation == "poll" and existing != planned_existing:
             reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
             _persist(root, reconciled.next_state, branch)
@@ -360,6 +499,11 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
                 existing = _existing(root, repository, github)
             if key not in existing:
                 raise RuntimeError("PR success is not yet observable; retry without persisting candidate")
+            if operation == "poll":
+                _repair_poll_comments(root, runtime, repository, existing, handled, github)
+            else:
+                _guard_canary_comments(root, runtime, repository, existing, handled, github)
+    _ensure_comment(runtime, repository, _pr_number(root, key), key, existing[key], github)
     reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
     _persist(root, reconciled.next_state, branch)
     return "canary" if operation == "canary" else "trigger"
@@ -384,7 +528,7 @@ def main():
                          canary_approved=os.getenv("SENTINEL_CANARY_APPROVED") == "true")
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
         # Do not echo subprocess stderr, API responses, environment, or account data.
-        print("publisher: refused or failed; no trigger candidate acknowledged without a PR")
+        print("publisher: refused or failed; no trigger acknowledged without a PR and exact Codex comment")
         raise SystemExit(2)
     print(f"publisher: {result}")
 

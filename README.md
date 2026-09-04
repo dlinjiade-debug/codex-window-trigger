@@ -2,10 +2,11 @@
 
 Deployment is **disabled** until manually approved setup and a controlled canary
 succeed. A five-minute GitHub Actions probe reads public reset predictions and
-creates one bot PR for a new eligible episode. The matching ChatGPT Work/Codex
-event run is itself the single best-effort five-hour-window touch.
+creates one bot PR for a new eligible episode, then posts exactly one
+non-review `@codex` PR comment. The resulting Codex Cloud chat is itself the
+single best-effort five-hour-window touch.
 
-This project cannot read a personal account's live five-hour balance. If included usage is already exhausted, the cloud touch may use an existing flexible-credit balance. Keep auto-reload off and pause the ChatGPT event task before purchasing credits. The touch is best-effort and does not prove that the five-hour timer moved.
+This project cannot read a personal account's live five-hour balance. If included usage is already exhausted, the cloud touch may use an existing flexible-credit balance. Keep auto-reload off and pause the sentinel before purchasing credits. The touch is best-effort and does not prove that the five-hour timer moved.
 
 No promise of two full five-hour windows or zero credit use is possible. Before
 enablement, the user must confirm auto-reload is off and there is no existing
@@ -20,7 +21,9 @@ supplied, an unhandled stable episode key, and 24 hours since any successful
 trigger (including canary). First valid observation only establishes baseline.
 Invalid/stale data fails closed. State detail records are bounded to 100;
 handled identities remain durable. All open and closed PR pages are inspected,
-but only same-repository `github-actions[bot]` PRs affect deduplication/cooldown.
+but only same-repository `github-actions[bot]` PRs are candidates. Before a
+new candidate is acknowledged, an exact same-bot `@codex` comment must also be
+observable. Outsider and near-match comments never satisfy idempotency.
 
 Only code, synthetic tests, public signal metadata, trigger records and dedup
 state belong in this dedicated **public** repository. Never upload accounts,
@@ -28,9 +31,10 @@ login data, cookies, personal emails, secrets, unrelated projects, `.runtime`,
 or `.superpowers` execution ledgers. Inspect `git diff --cached` before any
 manual commit/push; never force-add ignored files.
 
-The workflow uses the repository-scoped `GITHUB_TOKEN` only, with `contents:
-write` and `pull-requests: write` (all other permissions none). Standard
-`ubuntu-latest` runners only. Release commits are pinned: checkout v7.0.1 and
+The workflow uses the repository-scoped `GITHUB_TOKEN` only, with
+`contents: write`, `issues: write`, and `pull-requests: write` (all other
+permissions none). Standard `ubuntu-latest` runners only. Release commits are
+pinned: checkout v7.0.1 and
 setup-python v7.0.0, verified 2026-08-31. No external Python dependencies.
 
 ## Setup (manual, schedule stays OFF)
@@ -40,9 +44,10 @@ setup-python v7.0.0, verified 2026-08-31. No external Python dependencies.
    Leave `SENTINEL_ENABLED` unset or `false`; disabled scheduled jobs allocate
    no runner. No keepalive commits are created.
 2. Allow GitHub Actions to create pull requests in this repository's settings.
-   Authorize the ChatGPT GitHub connector for this repository only. Configure
-   the exact filters and short prompt in [event-task instructions](docs/chatgpt-event-task.md).
-   If exact bot author AND newly-opened-PR-only filters are unavailable, stop.
+   Authorize the Codex GitHub connector for this repository only. Create one
+   minimal Codex Cloud environment for the exact repository, with no secrets or
+   environment variables and internet access off. Do not enable automatic code
+   review. Follow the [direct cloud-trigger instructions](docs/codex-cloud-trigger.md).
 3. Run local tests and schema validation below. Manually dispatch the sentinel
    with `operation=poll`, `dry_run=true` (the default). Dry-run never mutates
    Git, PRs, or stored state, regardless of operation/approval/enablement.
@@ -50,11 +55,12 @@ setup-python v7.0.0, verified 2026-08-31. No external Python dependencies.
    `dry_run=false`. It can only initialize (or no-op if already initialized),
    never create a PR. It does not require enabling the schedule.
 5. Reconfirm credit safeguards. Obtain explicit user approval for this specific
-   one-time canary at action time. Follow [the controlled canary procedure](docs/chatgpt-event-task.md)
+   one-time canary at action time. Follow [the controlled canary procedure](docs/codex-cloud-trigger.md)
    with `operation=canary`, `dry_run=false`, `canary_approved=true`. Baseline is
    required. Approval defaults false and never authorizes normal polling.
-6. Verify the single short receipt, no extra work/tools, and offline cloud
-   operation. If the connector ignores bot-token PRs, deployment is blocked;
+6. Verify exactly one PR comment, one Cloud chat, the single short receipt, no
+   extra work/tools/changes, and offline cloud operation. If Codex ignores a
+   bot-authored mention, deployment is blocked;
    do not bypass with new credentials. Leave the canary PR open.
 7. Only after acceptance, set repository variable `SENTINEL_ENABLED=true` for
    live scheduled polling. Manual live `poll` also requires this variable.
@@ -62,9 +68,9 @@ setup-python v7.0.0, verified 2026-08-31. No external Python dependencies.
 | Operation | Dry-run | Live prerequisites | Possible persistent change |
 | --- | --- | --- | --- |
 | Any | true | None of the live gates | None |
-| poll | false | schedule/manual; enabled | State and at most one eligible PR |
+| poll | false | schedule/manual; enabled | State and at most one eligible PR/comment pair |
 | baseline | false | manual dispatch | First initialization only |
-| canary | false | manual; initialized; approval now | One fixed canary and state |
+| canary | false | manual; initialized; approval now | One fixed canary PR/comment pair and state |
 
 The publisher independently enforces these gates, public visibility, repository
 identity, every effective origin push/fetch URL, clean tracked files, and the
@@ -93,16 +99,20 @@ environment; local CLI planning by itself never publishes anything.
 ## Transactions, retries, and logs
 
 The CLI stages only ignored `.runtime` files. The publisher queries all PR pages,
-pushes one deterministic `trigger/<12-hex>` branch, then creates a literal-title
-PR. Only after the PR is observable does it reconcile original stored state
-against the PR's actual creation timestamp and commit state to the default branch.
-It never persists a trigger candidate as proof of success. PRs stay open.
+pushes one deterministic `trigger/<12-hex>` branch, creates a literal-title PR,
+and posts a JSON-file-backed non-review `@codex` issue comment. Only after the
+trusted PR and exact bot-authored comment are both observable does it reconcile
+stored state against the PR's actual creation timestamp and commit state to the
+default branch. It never persists a trigger candidate as proof of success. PRs
+stay open.
 
 A failed PR create leaves an immutable trigger commit to reuse. A later poll
 reuses the original payload, even if the new poll has a different receipt time;
 unknown branch content is refused, never overwritten or force-pushed. Uncertain
-push/create results are re-queried. A failed state push is recovered from the
-existing PR on the next fresh default-branch checkout, without duplicate PRs.
+push, PR, and comment results are re-queried across all pages. A retry completes
+one missing exact comment without creating a second PR/comment; more than one
+unacknowledged PR fails closed before any cloud touch. A failed state push is
+recovered from the observable PR/comment pair on the next fresh checkout.
 Do not manually edit/rewrite trigger branches or automatically close them.
 
 Actions logs report the publisher outcome and a short public decision containing
@@ -119,8 +129,8 @@ does not make artificial keepalive commits.
 
 ## Rollback
 
-First pause the ChatGPT event task; then set `SENTINEL_ENABLED=false` and disable
-the GitHub workflow. Only then close trigger PRs if desired. Disconnect the
-repository from ChatGPT if retiring the integration. Repository deletion is a
-separate destructive action requiring new approval. Pause the event task before
-buying credits or enabling auto-reload later.
+First set `SENTINEL_ENABLED=false` and disable the GitHub workflow. Only then
+close trigger PRs if desired. Disconnect the repository/environment from Codex
+if retiring the integration. Repository deletion is a separate destructive
+action requiring new approval. Pause the sentinel before buying credits or
+enabling auto-reload later.

@@ -9,14 +9,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from codex_window_trigger.io import read_json
 from codex_window_trigger.main import write_json
 from codex_window_trigger.state import empty_state
-from scripts.publish import GitHub, main, publish
+from scripts.publish import GitHub, WARNING, main, publish
 from tests.helpers import payloads
 
 
 NOW = datetime(2026, 8, 31, 1, 0, tzinfo=UTC)
 REPOSITORY = "example/codex-window-trigger"
+FIXTURE_KEY = "563920b58ca7ca37a1e0a80649ba7479c8cfa9f5ecfb9ff99a4259b6bbeee757"
 
 
 def git(root, *args):
@@ -37,7 +39,11 @@ class FakeGitHub:
         self.pages = [[]]
         self.created_at = "2026-08-31T01:00:07Z"
         self.create_mode = "success"
+        self.comment_mode = "success"
+        self.comment_list_mode = "success"
         self.created = 0
+        self.commented = 0
+        self.comment_pages = {}
 
     def repository(self, repository):
         if repository != REPOSITORY:
@@ -55,16 +61,54 @@ class FakeGitHub:
         if self.create_mode == "fail":
             raise RuntimeError("simulated create failure")
         self.created += 1
-        self.pages[-1].append(raw_pr(title, branch, self.created_at))
+        self.pages[-1].append(raw_pr(title, branch, self.created_at, number=self.created))
         if self.create_mode == "uncertain":
             raise RuntimeError("simulated lost success response")
         return "https://github.com/example/codex-window-trigger/pull/1"
 
+    def list_issue_comments(self, repository, number):
+        if repository != REPOSITORY or not isinstance(number, int) or number <= 0:
+            raise AssertionError("wrong comment destination")
+        if self.comment_list_mode == "fail":
+            raise RuntimeError("simulated comment-list failure")
+        return deepcopy(self.comment_pages.get(number, [[]]))
 
-def raw_pr(title, branch, created_at, *, author="github-actions[bot]", head_repo=REPOSITORY):
-    return {"title": title, "created_at": created_at, "user": {"login": author},
+    def create_issue_comment(self, repository, number, body_file):
+        if repository != REPOSITORY or not isinstance(number, int) or number <= 0:
+            raise AssertionError("wrong comment destination")
+        if self.comment_mode == "fail":
+            raise RuntimeError("simulated comment failure")
+        value = json.loads(Path(body_file).read_text(encoding="utf-8"))
+        if set(value) != {"body"} or not isinstance(value["body"], str):
+            raise AssertionError("comment transport must use one JSON body field")
+        self.commented += 1
+        self.comment_pages.setdefault(number, [[]])[-1].append(raw_comment(value["body"]))
+        if self.comment_mode == "uncertain":
+            raise RuntimeError("simulated lost comment response")
+        return {"html_url": f"https://github.com/{REPOSITORY}/pull/{number}#issuecomment-1"}
+
+
+def raw_pr(title, branch, created_at, *, number=1, author="github-actions[bot]", head_repo=REPOSITORY):
+    return {"number": number, "title": title, "created_at": created_at, "user": {"login": author},
             "head": {"ref": branch, "repo": {"full_name": head_repo}},
             "base": {"ref": "main", "repo": {"full_name": REPOSITORY}}}
+
+
+def raw_comment(body, *, author="github-actions[bot]"):
+    return {"id": 1, "body": body, "user": {"login": author},
+            "html_url": f"https://github.com/{REPOSITORY}/pull/1#issuecomment-1"}
+
+
+def expected_comment(key, created_at):
+    return (
+        "@codex Do not inspect files, run commands, modify the repository, create commits, "
+        "or post follow-ups. Reply with exactly the receipt block below and then stop.\n\n"
+        "codex-window-trigger receipt\n"
+        f"key={key}\n"
+        f"pr_created_utc={created_at}\n"
+        f"warning={WARNING}\n\n"
+        f"<!-- codex-window-trigger:{key} -->\n"
+    )
 
 
 class PublishTest(unittest.TestCase):
@@ -157,6 +201,19 @@ class PublishTest(unittest.TestCase):
         self.assertEqual("skip", self.run_publish(operation="baseline", dry_run=False))
         self.assertEqual(before, git(self.remote, "show-ref"))
         self.assertEqual(0, self.github.created)
+
+    def test_baseline_refuses_uncommented_trigger_pr_without_mutating_anything(self):
+        key = "a" * 64
+        self.github.pages = [[raw_pr(
+            f"[codex-5h-touch] {key}", f"trigger/{key[:12]}",
+            "2026-08-31T00:59:00Z", number=8)]]
+        before = self.remote_state()
+
+        with self.assertRaises(ValueError):
+            self.run_publish(operation="baseline", dry_run=False)
+
+        self.assertEqual(0, self.github.commented)
+        self.assertEqual(before, self.remote_state())
 
     def test_live_poll_creates_one_pr_then_records_actual_pr_time(self):
         self.initialize()
@@ -307,15 +364,148 @@ class PublishTest(unittest.TestCase):
         self.assertEqual("canary", self.run_publish(operation="canary", canary_approved=True, dry_run=False))
         self.assertEqual("[codex-5h-touch] canary-000000000000", self.github.pages[-1][-1]["title"])
         self.assertEqual("trigger/000000000000", self.github.pages[-1][-1]["head"]["ref"])
+        comment = expected_comment("canary-000000000000", "2026-08-31T01:00:07+00:00")
+        self.assertEqual([[raw_comment(comment)]], self.github.comment_pages.get(1, []))
         self.assertEqual("skip", self.run_publish(operation="canary", canary_approved=True,
                          dry_run=False, now=datetime(2026, 8, 31, 1, 5, tzinfo=UTC)))
         self.assertEqual("2026-08-31T01:00:07+00:00", self.remote_state()["last_triggered_at"])
         self.assertEqual(1, self.github.created)
+        self.assertEqual(1, self.github.commented)
+
+    def test_lost_comment_response_is_requeried_before_state_is_persisted(self):
+        self.initialize()
+        self.github.comment_mode = "uncertain"
+
+        try:
+            result = self.run_publish(operation="canary", canary_approved=True, dry_run=False)
+        except RuntimeError as exc:
+            result = f"raised: {exc}"
+        self.assertEqual("canary", result)
+
+        self.assertEqual(1, self.github.created)
+        self.assertEqual(1, self.github.commented)
+        self.assertIn("canary-000000000000", self.remote_state()["handled_keys"])
+
+    def test_failed_comment_never_persists_a_trigger_receipt(self):
+        self.initialize()
+        before = self.remote_state()
+        self.github.comment_mode = "fail"
+
+        with self.assertRaises(RuntimeError):
+            self.run_publish(operation="canary", canary_approved=True, dry_run=False)
+
+        self.assertEqual(1, self.github.created)
+        self.assertEqual(0, self.github.commented)
+        self.assertEqual(before, self.remote_state())
+
+    def test_only_exact_bot_comment_on_any_page_satisfies_idempotency(self):
+        self.initialize()
+        key = "canary-000000000000"
+        created = "2026-08-31T00:59:00+00:00"
+        comment = expected_comment(key, created)
+        self.github.pages = [[raw_pr(
+            f"[codex-5h-touch] {key}", "trigger/000000000000",
+            "2026-08-31T00:59:00Z", number=19)]]
+        self.github.comment_pages[19] = [
+            [raw_comment(comment, author="outsider"), raw_comment(comment + " ")],
+            [raw_comment(comment)],
+        ]
+
+        self.assertEqual("skip", self.run_publish(
+            operation="canary", canary_approved=True, dry_run=False))
+
+        self.assertEqual(0, self.github.created)
+        self.assertEqual(0, self.github.commented)
+        self.assertIn(key, self.remote_state()["handled_keys"])
+
+    def test_existing_canary_pr_without_comment_is_completed_not_acknowledged_early(self):
+        self.initialize()
+        self.github.pages = [[raw_pr(
+            "[codex-5h-touch] canary-000000000000", "trigger/000000000000",
+            "2026-08-31T00:59:00Z", number=17)]]
+
+        result = self.run_publish(operation="canary", canary_approved=True, dry_run=False)
+
+        self.assertEqual("canary", result)
+        self.assertEqual(0, self.github.created)
+        self.assertEqual(1, self.github.commented)
+        self.assertIn("canary-000000000000", self.remote_state()["handled_keys"])
+
+    def test_existing_poll_pr_without_comment_is_repaired_before_reconciliation(self):
+        self.initialize()
+        self.github.pages = [[raw_pr(
+            f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+            "2026-08-31T00:59:00Z", number=23)]]
+
+        result = self.run_publish(enabled=True, dry_run=False)
+
+        self.assertEqual("reconcile", result)
+        self.assertEqual(0, self.github.created)
+        self.assertEqual(1, self.github.commented)
+        self.assertIn(FIXTURE_KEY, self.remote_state()["handled_keys"])
+
+    def test_finalized_history_does_not_depend_on_comment_api_availability(self):
+        self.initialize()
+        state = read_json(self.root / "state/state.json")
+        state["handled_keys"] = [FIXTURE_KEY]
+        state["last_triggered_at"] = "2026-08-31T00:59:00+00:00"
+        write_json(self.root / "state/state.json", state)
+        git(self.root, "add", "state/state.json")
+        git(self.root, "commit", "-m", "finalized trigger")
+        git(self.root, "push", "origin", "HEAD:refs/heads/main")
+        self.github.pages = [[raw_pr(
+            f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+            "2026-08-31T00:59:00Z", number=23)]]
+        self.github.comment_list_mode = "fail"
+
+        try:
+            result = self.run_publish(enabled=True, dry_run=False)
+        except RuntimeError as exc:
+            result = f"raised: {exc}"
+
+        self.assertEqual("skip", result)
+        self.assertEqual(0, self.github.commented)
+
+    def test_multiple_uncommented_prs_fail_before_any_cloud_touch(self):
+        self.initialize()
+        before = self.remote_state()
+        other = "b" * 64
+        self.github.pages = [[
+            raw_pr(f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+                   "2026-08-31T00:58:00Z", number=23),
+            raw_pr(f"[codex-5h-touch] {other}", f"trigger/{other[:12]}",
+                   "2026-08-31T00:59:00Z", number=24),
+        ]]
+
+        with self.assertRaises(ValueError):
+            self.run_publish(enabled=True, dry_run=False)
+
+        self.assertEqual(0, self.github.commented)
+        self.assertEqual(before, self.remote_state())
+
+    def test_canary_approval_never_repairs_a_different_uncommented_pr(self):
+        self.initialize()
+        before = self.remote_state()
+        other = "d" * 64
+        self.github.pages = [[raw_pr(
+            f"[codex-5h-touch] {other}", f"trigger/{other[:12]}",
+            "2026-08-31T00:59:00Z", number=31)]]
+
+        with self.assertRaises(ValueError):
+            self.run_publish(operation="canary", canary_approved=True, dry_run=False)
+
+        self.assertEqual(0, self.github.created)
+        self.assertEqual(0, self.github.commented)
+        self.assertEqual(before, self.remote_state())
 
     def test_recent_trusted_pr_blocks_approved_canary(self):
         self.initialize()
-        self.github.pages[-1].append(raw_pr("[codex-5h-touch] " + "d" * 64,
-                                            "trigger/" + "d" * 12, "2026-08-31T00:59:00Z"))
+        key = "d" * 64
+        self.github.pages[-1].append(raw_pr(f"[codex-5h-touch] {key}",
+                                            f"trigger/{key[:12]}", "2026-08-31T00:59:00Z",
+                                            number=30))
+        self.github.comment_pages[30] = [[raw_comment(
+            expected_comment(key, "2026-08-31T00:59:00+00:00"))]]
 
         self.assertEqual("skip", self.run_publish(operation="canary", canary_approved=True, dry_run=False))
 
@@ -323,8 +513,9 @@ class PublishTest(unittest.TestCase):
         self.assertEqual("2026-08-31T00:59:00+00:00", self.remote_state()["last_triggered_at"])
         self.assertEqual("refs/heads/main", git(self.remote, "for-each-ref", "--format=%(refname)"))
 
-    def test_trusted_pr_arriving_before_canary_mutation_blocks_canary(self):
+    def test_uncommented_pr_arriving_before_canary_mutation_fails_closed(self):
         self.initialize()
+        before = self.remote_state()
         initial_list = self.github.list_prs
         calls = 0
 
@@ -333,16 +524,43 @@ class PublishTest(unittest.TestCase):
             calls += 1
             if calls == 3:
                 self.github.pages[-1].append(raw_pr("[codex-5h-touch] " + "e" * 64,
-                                                    "trigger/" + "e" * 12, "2026-08-31T00:59:00Z"))
+                                                    "trigger/" + "e" * 12, "2026-08-31T00:59:00Z",
+                                                    number=32))
             return initial_list(repository)
 
         self.github.list_prs = list_with_late_pr
-        self.assertEqual("skip", self.run_publish(operation="canary", canary_approved=True, dry_run=False))
+        with self.assertRaises(ValueError):
+            self.run_publish(operation="canary", canary_approved=True, dry_run=False)
 
         self.assertEqual(0, self.github.created)
-        self.assertEqual("2026-08-31T00:59:00+00:00", self.remote_state()["last_triggered_at"])
+        self.assertEqual(0, self.github.commented)
+        self.assertEqual(before, self.remote_state())
         self.assertEqual(["refs/heads/main", "refs/heads/trigger/000000000000"],
                          git(self.remote, "for-each-ref", "--format=%(refname)").splitlines())
+
+    def test_uncommented_pr_arriving_with_created_canary_fails_before_comment(self):
+        self.initialize()
+        before = self.remote_state()
+        initial_list = self.github.list_prs
+        calls = 0
+
+        def list_with_final_race(repository):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                other = "f" * 64
+                self.github.pages[-1].append(raw_pr(
+                    f"[codex-5h-touch] {other}", f"trigger/{other[:12]}",
+                    "2026-08-31T00:59:00Z", number=55))
+            return initial_list(repository)
+
+        self.github.list_prs = list_with_final_race
+        with self.assertRaises(ValueError):
+            self.run_publish(operation="canary", canary_approved=True, dry_run=False)
+
+        self.assertEqual(1, self.github.created)
+        self.assertEqual(0, self.github.commented)
+        self.assertEqual(before, self.remote_state())
 
     def test_manual_environment_dry_run_cannot_be_overridden_by_live_flag(self):
         self.initialize()
@@ -372,6 +590,7 @@ class PublishTest(unittest.TestCase):
         self.github.list_prs = list_with_new_pr
         self.assertEqual("reconcile", self.run_publish(enabled=True, dry_run=False))
         self.assertEqual(0, self.github.created)
+        self.assertEqual(1, self.github.commented)
         self.assertEqual("2026-08-31T00:59:00+00:00", self.remote_state()["last_triggered_at"])
 
     def test_scheduled_live_poll_is_allowed_only_when_enabled(self):
@@ -406,24 +625,37 @@ class PublishTest(unittest.TestCase):
 
 
 class GitHubTransportTest(unittest.TestCase):
-    def test_all_pages_and_untrusted_pr_text_use_literal_argument_boundaries(self):
+    def test_all_pages_and_untrusted_text_use_literal_argument_boundaries(self):
         calls = []
         title = "[codex-5h-touch] literal $(do-not-execute)"
 
         def external(args, **kwargs):
             calls.append((args, kwargs))
-            if args[:2] == ["gh", "api"]:
+            if "pulls?state=all" in args[-1]:
                 return subprocess.CompletedProcess(args, 0, stdout='[[{"title":"page-one"}],[{"title":"page-two"}]]')
+            if "comments?per_page=100" in args[-1]:
+                return subprocess.CompletedProcess(args, 0, stdout='[[{"body":"page-one"}],[{"body":"page-two"}]]')
+            if args[:4] == ["gh", "api", "--method", "POST"]:
+                return subprocess.CompletedProcess(args, 0, stdout='{"html_url":"https://example.invalid/comment/1"}')
             return subprocess.CompletedProcess(args, 0, stdout="https://example.invalid/pr/1")
 
         with patch("scripts.publish.subprocess.run", side_effect=external):
             pages = GitHub().list_prs(REPOSITORY)
             GitHub().create_pr(REPOSITORY, "main", "trigger/123456789abc", title, Path("literal body.md"))
+            comments = GitHub().list_issue_comments(REPOSITORY, 7)
+            created = GitHub().create_issue_comment(REPOSITORY, 7, Path("literal comment.json"))
         self.assertEqual([[{"title": "page-one"}], [{"title": "page-two"}]], pages)
+        self.assertEqual([[{"body": "page-one"}], [{"body": "page-two"}]], comments)
+        self.assertEqual("https://example.invalid/comment/1", created["html_url"])
         self.assertEqual(["gh", "api", "--paginate", "--slurp",
                           "repos/example/codex-window-trigger/pulls?state=all&per_page=100"], calls[0][0])
         self.assertEqual(["gh", "pr", "create", "--repo", REPOSITORY, "--base", "main", "--head",
                           "trigger/123456789abc", "--title", title, "--body-file", "literal body.md"], calls[1][0])
+        self.assertEqual(["gh", "api", "--paginate", "--slurp",
+                          "repos/example/codex-window-trigger/issues/7/comments?per_page=100"], calls[2][0])
+        self.assertEqual(["gh", "api", "--method", "POST",
+                          "repos/example/codex-window-trigger/issues/7/comments",
+                          "--input", "literal comment.json"], calls[3][0])
         self.assertTrue(all(not kwargs.get("shell", False) for _, kwargs in calls))
 
 

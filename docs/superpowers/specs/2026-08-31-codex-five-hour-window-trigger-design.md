@@ -3,6 +3,12 @@
 日期：2026-08-31
 状态：规格已通过；2026-08-31 用户另行同意改用专用公开仓库免费方案
 
+> 2026-09-04 实施修订：网页端事件任务无法在分配运行前表达全部可信过滤器，
+> 因此改为由同仓库 GitHub Actions 在可信 PR 后发布一条幂等、非评审
+> `@codex` 评论，直接启动 Codex Cloud chat。状态只有在 PR 与精确 bot 评论
+> 均可观察后才落盘；Cloud 环境无 secrets、关闭 internet，自动代码评审关闭。
+> 本修订取代下文关于 ChatGPT Web PR 事件监听器的交付描述。
+
 ## 1. 目标
 
 当公开预测表明 Codex 可能即将发生全局用量重置时，让 **Codex/ChatGPT Work 云端事件任务启动一次**。该事件运行本身就是一次 Codex 用量触碰，用于尝试让尚未开始的五小时窗口提前计时；它不再派生第二个任务，也不负责把额度耗尽。
@@ -124,6 +130,7 @@ OpenAI 没有为个人账户提供可供此云端探针读取的实时五小时�
 ```yaml
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 ```
 

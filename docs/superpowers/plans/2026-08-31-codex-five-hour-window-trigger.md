@@ -12,6 +12,8 @@
 
 **Execution status:** Approved. On 2026-08-31 the user additionally approved using a dedicated PUBLIC repository to keep standard GitHub-hosted runner polling free. Earlier repository-visibility drafts are superseded by this amendment. Local implementation is isolated in a new repository on branch `codex/window-trigger`, never in the unrelated parent checkout. The controller performs the initial repository/document bootstrap before Task 1.
 
+**2026-09-04 delivery amendment:** The prompt-only ChatGPT GitHub event listener was not deployable with the required pre-allocation filters. The approved replacement is one exact, idempotent, non-review `@codex` issue comment posted by the same repository workflow after its trusted PR. A minimal Codex Cloud environment has no secrets and internet off; automatic code review remains off. The PR and exact bot comment must both be observable before state is persisted. This amendment supersedes the event-listener setup steps below; see `docs/codex-cloud-trigger.md`.
+
 ## Global Constraints
 
 - The probability threshold is exactly `30` percent.
@@ -23,7 +25,7 @@
 - Use one trigger per episode and a global 24-hour cooldown.
 - The GitHub-triggered Work/Codex event run is the only quota touch. It must not create or invoke a second task.
 - Do not use an OpenAI API key, Gmail secret, PAT, Cookie, or other long-lived secret.
-- Use only the repository-scoped `GITHUB_TOKEN` with `contents: write` and `pull-requests: write`.
+- Use only the repository-scoped `GITHUB_TOKEN` with `contents: write`, `issues: write`, and `pull-requests: write`.
 - The user must confirm auto-reload is off and acknowledge the residual flexible-credit risk before enabling the live ChatGPT event task.
 - Never claim that the touch definitely re-anchors the five-hour window or guarantees two full windows.
 - The dedicated repository is PUBLIC by explicit user consent. Never upload other projects, account details, email addresses, local execution ledgers, or credentials.
@@ -974,7 +976,7 @@ Document the UI settings: GitHub event = new pull request; head and base reposit
 The README must include setup, dry-run, live enablement, logs, rollback, and this exact warning:
 
 ```text
-This project cannot read a personal account's live five-hour balance. If included usage is already exhausted, the cloud touch may use an existing flexible-credit balance. Keep auto-reload off and pause the ChatGPT event task before purchasing credits. The touch is best-effort and does not prove that the five-hour timer moved.
+This project cannot read a personal account's live five-hour balance. If included usage is already exhausted, the cloud touch may use an existing flexible-credit balance. Keep auto-reload off and pause the sentinel before purchasing credits. The touch is best-effort and does not prove that the five-hour timer moved.
 ```
 
 - [ ] **Step 7: Run the full local verification**
@@ -1027,7 +1029,7 @@ Expected: zero test failures; compile and diff checks exit zero; status is clean
 Run:
 
 ```powershell
-rg -n "permissions:|contents: write|pull-requests: write|GITHUB_TOKEN|github.token|OPENAI_API_KEY|PAT|eval |pull_request_target|cron:" .github codex_window_trigger README.md
+rg -n "permissions:|contents: write|issues: write|pull-requests: write|GITHUB_TOKEN|github.token|OPENAI_API_KEY|PAT|eval |pull_request_target|cron:" .github codex_window_trigger README.md
 ```
 
 Expected: only the two intended write permissions and `github.token`; none of the forbidden secret names or unsafe constructs.

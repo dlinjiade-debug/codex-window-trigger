@@ -1,4 +1,13 @@
-# Single-run GitHub event task (manual setup; not activated)
+# Superseded ChatGPT event-listener design
+
+This prompt-only listener design was rejected because the available UI could
+not enforce the required repository, author, newly-opened-only, and title
+filters before allocating a run. It must not be enabled.
+
+The approved implementation uses one idempotent, non-review `@codex` PR comment
+after a trusted workflow PR. See [Direct Codex Cloud trigger](codex-cloud-trigger.md).
+
+The remainder is retained only as historical rationale.
 
 Do not save/enable this event task until its UI can enforce all these filters
 *before* allocating a cloud run:
