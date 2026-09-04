@@ -110,9 +110,11 @@ A failed PR create leaves an immutable trigger commit to reuse. A later poll
 reuses the original payload, even if the new poll has a different receipt time;
 unknown branch content is refused, never overwritten or force-pushed. Uncertain
 push, PR, and comment results are re-queried across all pages. A retry completes
-one missing exact comment without creating a second PR/comment; more than one
-unacknowledged PR fails closed before any cloud touch. A failed state push is
-recovered from the observable PR/comment pair on the next fresh checkout.
+one missing exact comment without creating a second PR/comment, but first applies
+the 24-hour cooldown from persisted state and every other confirmed comment. A
+recent confirmed touch defers that repair; more than one unacknowledged PR fails
+closed before any cloud touch. A failed state push is recovered from the
+observable PR/comment pair on the next fresh checkout.
 Do not manually edit/rewrite trigger branches or automatically close them.
 
 Actions logs report the publisher outcome and a short public decision containing

@@ -131,22 +131,35 @@ def _existing(root, repository, github):
                                "created_at": item.get("created_at")})
     target = _safe_path(root, ".runtime/prs.json")
     write_json(target, normalized)
-    return read_existing_prs(target)
+    existing = read_existing_prs(target)
+    if set(_pr_numbers(normalized)) != set(existing):
+        raise ValueError("matching trigger PR number is missing")
+    return existing
 
 
-def _pr_number(root, key):
-    value = read_json(_safe_path(root, ".runtime/prs.json"))
-    matches = []
+def _pr_numbers(value):
+    numbers = {}
     for item in value:
-        if (isinstance(item, dict) and item.get("title") == f"[codex-5h-touch] {key}"
+        if isinstance(item, dict) and isinstance(item.get("title"), str):
+            key = item["title"].removeprefix("[codex-5h-touch] ")
+        else:
+            continue
+        if (_KEY.fullmatch(key)
                 and item.get("headRefName") == f"trigger/{'000000000000' if key == _CANARY else key[:12]}"):
             number = item.get("number")
             if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
                 raise ValueError("matching trigger PR number is invalid")
-            matches.append(number)
-    if len(matches) != 1:
+            if key in numbers:
+                raise ValueError("matching trigger PR number is not unique")
+            numbers[key] = number
+    return numbers
+
+
+def _pr_number(root, key):
+    numbers = _pr_numbers(read_json(_safe_path(root, ".runtime/prs.json")))
+    if key not in numbers:
         raise ValueError("matching trigger PR number is not unique")
-    return matches[0]
+    return numbers[key]
 
 
 def _plan(root, now, fixtures, dry_run):
@@ -282,33 +295,39 @@ def _handled_keys(state):
     return handled
 
 
-def _repairable_comments(root, repository, existing, handled, github):
+def _comment_status(root, repository, existing, handled, github):
+    confirmed = {}
     missing = []
     for key, created_at in existing.items():
         if key in handled:
+            confirmed[key] = created_at
             continue
         number = _pr_number(root, key)
-        if not _comment_exists(repository, number, _comment_body(key, created_at), github):
+        if _comment_exists(repository, number, _comment_body(key, created_at), github):
+            confirmed[key] = created_at
+        else:
             missing.append((key, created_at, number))
     if len(missing) > 1:
         raise ValueError("multiple trigger PRs lack an exact Codex comment")
-    return missing
+    return confirmed, missing
 
 
-def _guard_canary_comments(root, runtime, repository, existing, handled, github):
-    missing = _repairable_comments(root, repository, existing, handled, github)
+def _prepare_comments(root, runtime, repository, existing, handled, state, now,
+                      operation, github):
+    confirmed, missing = _comment_status(root, repository, existing, handled, github)
     if not missing:
-        return False
+        return existing, False, None
     key, created_at, number = missing[0]
-    if key != _CANARY:
+    if operation == "baseline":
+        raise ValueError("baseline cannot acknowledge a trigger PR without a Codex comment")
+    if operation == "canary" and key != _CANARY:
         raise ValueError("canary approval cannot repair a different trigger PR")
-    return _ensure_comment(runtime, repository, number, key, created_at, github)
-
-
-def _repair_poll_comments(root, runtime, repository, existing, handled, github):
-    for key, created_at, number in _repairable_comments(
-            root, repository, existing, handled, github):
-        _ensure_comment(runtime, repository, number, key, created_at, github)
+    transition = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
+    last = transition.next_state["last_triggered_at"]
+    if last is not None and now - parse_utc(last) < timedelta(hours=24):
+        return confirmed, False, transition
+    created = _ensure_comment(runtime, repository, number, key, created_at, github)
+    return existing, created, None
 
 
 def _remote_branch(root, branch):
@@ -417,13 +436,13 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     if operation == "canary" and not state["initialized"]:
         raise ValueError("canary requires initialized state")
     existing = _existing(root, repository, github)
-    if operation == "poll":
-        _repair_poll_comments(root, runtime, repository, existing, handled, github)
-    elif operation == "canary":
-        completed_canary = _guard_canary_comments(
-            root, runtime, repository, existing, handled, github)
-    elif _repairable_comments(root, repository, existing, handled, github):
-        raise ValueError("baseline cannot acknowledge a trigger PR without a Codex comment")
+    completed_canary = False
+    existing, repaired, blocked = _prepare_comments(
+        root, runtime, repository, existing, handled, state, now, operation, github)
+    completed_canary = operation == "canary" and repaired
+    if blocked is not None:
+        _persist(root, blocked.next_state, branch)
+        return "skip" if operation == "canary" else blocked.action
     if operation == "canary":
         if _CANARY in existing:
             reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
@@ -450,9 +469,13 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     planned_existing = existing
     existing = _existing(root, repository, github)
     key = payload["key"]
+    existing, repaired, blocked = _prepare_comments(
+        root, runtime, repository, existing, handled, state, now, operation, github)
+    completed_canary = completed_canary or (operation == "canary" and repaired)
+    if blocked is not None:
+        _persist(root, blocked.next_state, branch)
+        return "skip" if operation == "canary" else blocked.action
     if operation == "canary":
-        completed_canary = _guard_canary_comments(
-            root, runtime, repository, existing, handled, github)
         if _CANARY in existing:
             reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
             _persist(root, reconciled.next_state, branch)
@@ -461,8 +484,6 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
         if cooling_down:
             _persist(root, reconciled_state, branch)
             return "skip"
-    else:
-        _repair_poll_comments(root, runtime, repository, existing, handled, github)
     if operation == "poll" and existing != planned_existing:
         reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
         _persist(root, reconciled.next_state, branch)
@@ -470,9 +491,13 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     if key not in existing:
         payload = _ensure_branch(root, trigger_branch, payload, runtime)
         existing = _existing(root, repository, github)
+        existing, repaired, blocked = _prepare_comments(
+            root, runtime, repository, existing, handled, state, now, operation, github)
+        completed_canary = completed_canary or (operation == "canary" and repaired)
+        if blocked is not None:
+            _persist(root, blocked.next_state, branch)
+            return "skip" if operation == "canary" else blocked.action
         if operation == "canary":
-            completed_canary = _guard_canary_comments(
-                root, runtime, repository, existing, handled, github)
             if _CANARY in existing:
                 reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
                 _persist(root, reconciled.next_state, branch)
@@ -481,8 +506,6 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
             if cooling_down:
                 _persist(root, reconciled_state, branch)
                 return "skip"
-        else:
-            _repair_poll_comments(root, runtime, repository, existing, handled, github)
         if operation == "poll" and existing != planned_existing:
             reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
             _persist(root, reconciled.next_state, branch)
@@ -499,10 +522,12 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
                 existing = _existing(root, repository, github)
             if key not in existing:
                 raise RuntimeError("PR success is not yet observable; retry without persisting candidate")
-            if operation == "poll":
-                _repair_poll_comments(root, runtime, repository, existing, handled, github)
-            else:
-                _guard_canary_comments(root, runtime, repository, existing, handled, github)
+            existing, repaired, blocked = _prepare_comments(
+                root, runtime, repository, existing, handled, state, now, operation, github)
+            completed_canary = completed_canary or (operation == "canary" and repaired)
+            if blocked is not None:
+                _persist(root, blocked.next_state, branch)
+                return "skip" if operation == "canary" else blocked.action
     _ensure_comment(runtime, repository, _pr_number(root, key), key, existing[key], github)
     reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
     _persist(root, reconciled.next_state, branch)

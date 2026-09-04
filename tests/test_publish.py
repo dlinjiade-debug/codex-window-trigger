@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_window_trigger.io import read_json
 from codex_window_trigger.main import write_json
 from codex_window_trigger.state import empty_state
-from scripts.publish import GitHub, WARNING, main, publish
+from scripts.publish import GitHub, main, publish
 from tests.helpers import payloads
 
 
@@ -82,7 +82,8 @@ class FakeGitHub:
         if set(value) != {"body"} or not isinstance(value["body"], str):
             raise AssertionError("comment transport must use one JSON body field")
         self.commented += 1
-        self.comment_pages.setdefault(number, [[]])[-1].append(raw_comment(value["body"]))
+        if self.comment_mode != "delayed":
+            self.comment_pages.setdefault(number, [[]])[-1].append(raw_comment(value["body"]))
         if self.comment_mode == "uncertain":
             raise RuntimeError("simulated lost comment response")
         return {"html_url": f"https://github.com/{REPOSITORY}/pull/{number}#issuecomment-1"}
@@ -106,7 +107,7 @@ def expected_comment(key, created_at):
         "codex-window-trigger receipt\n"
         f"key={key}\n"
         f"pr_created_utc={created_at}\n"
-        f"warning={WARNING}\n\n"
+        "warning=已启动一次云端五小时窗口触碰；并非已确认额度窗口重锚。\n\n"
         f"<!-- codex-window-trigger:{key} -->\n"
     )
 
@@ -398,6 +399,27 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(0, self.github.commented)
         self.assertEqual(before, self.remote_state())
 
+    def test_delayed_comment_visibility_is_reconciled_on_the_next_run(self):
+        self.initialize()
+        before = self.remote_state()
+        self.github.comment_mode = "delayed"
+
+        with self.assertRaises(RuntimeError):
+            self.run_publish(operation="canary", canary_approved=True, dry_run=False)
+
+        self.assertEqual(before, self.remote_state())
+        self.assertEqual(1, self.github.created)
+        self.assertEqual(1, self.github.commented)
+        self.github.comment_pages[1] = [[raw_comment(expected_comment(
+            "canary-000000000000", "2026-08-31T01:00:07+00:00"))]]
+
+        self.assertEqual("skip", self.run_publish(
+            operation="canary", canary_approved=True, dry_run=False,
+            now=datetime(2026, 8, 31, 1, 5, tzinfo=UTC)))
+        self.assertIn("canary-000000000000", self.remote_state()["handled_keys"])
+        self.assertEqual(1, self.github.created)
+        self.assertEqual(1, self.github.commented)
+
     def test_only_exact_bot_comment_on_any_page_satisfies_idempotency(self):
         self.initialize()
         key = "canary-000000000000"
@@ -444,6 +466,26 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(1, self.github.commented)
         self.assertIn(FIXTURE_KEY, self.remote_state()["handled_keys"])
 
+    def test_recent_commented_pr_blocks_repairing_a_second_poll_pr(self):
+        self.initialize()
+        completed = "d" * 64
+        self.github.pages = [[
+            raw_pr(f"[codex-5h-touch] {completed}", f"trigger/{completed[:12]}",
+                   "2026-08-31T00:59:00Z", number=24),
+            raw_pr(f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+                   "2026-08-31T00:58:00Z", number=23),
+        ]]
+        self.github.comment_pages[24] = [[raw_comment(
+            expected_comment(completed, "2026-08-31T00:59:00+00:00"))]]
+
+        self.assertEqual("reconcile", self.run_publish(enabled=True, dry_run=False))
+
+        state = self.remote_state()
+        self.assertEqual(0, self.github.commented)
+        self.assertIn(completed, state["handled_keys"])
+        self.assertNotIn(FIXTURE_KEY, state["handled_keys"])
+        self.assertEqual("2026-08-31T00:59:00+00:00", state["last_triggered_at"])
+
     def test_finalized_history_does_not_depend_on_comment_api_availability(self):
         self.initialize()
         state = read_json(self.root / "state/state.json")
@@ -464,6 +506,45 @@ class PublishTest(unittest.TestCase):
             result = f"raised: {exc}"
 
         self.assertEqual("skip", result)
+        self.assertEqual(0, self.github.commented)
+
+    def test_finalized_history_still_rejects_an_invalid_pr_number(self):
+        self.initialize()
+        state = read_json(self.root / "state/state.json")
+        state["handled_keys"] = [FIXTURE_KEY]
+        state["last_triggered_at"] = "2026-08-31T00:59:00+00:00"
+        write_json(self.root / "state/state.json", state)
+        git(self.root, "add", "state/state.json")
+        git(self.root, "commit", "-m", "finalized trigger")
+        git(self.root, "push", "origin", "HEAD:refs/heads/main")
+        self.github.pages = [[raw_pr(
+            f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+            "2026-08-31T00:59:00Z", number=0)]]
+
+        with self.assertRaises(ValueError):
+            self.run_publish(enabled=True, dry_run=False)
+
+        self.assertEqual(0, self.github.commented)
+
+    def test_finalized_history_still_rejects_duplicate_pr_numbers_for_one_key(self):
+        self.initialize()
+        state = read_json(self.root / "state/state.json")
+        state["handled_keys"] = [FIXTURE_KEY]
+        state["last_triggered_at"] = "2026-08-31T00:59:00+00:00"
+        write_json(self.root / "state/state.json", state)
+        git(self.root, "add", "state/state.json")
+        git(self.root, "commit", "-m", "finalized trigger")
+        git(self.root, "push", "origin", "HEAD:refs/heads/main")
+        self.github.pages = [[
+            raw_pr(f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+                   "2026-08-31T00:59:00Z", number=40),
+            raw_pr(f"[codex-5h-touch] {FIXTURE_KEY}", f"trigger/{FIXTURE_KEY[:12]}",
+                   "2026-08-31T00:59:00Z", number=41),
+        ]]
+
+        with self.assertRaises(ValueError):
+            self.run_publish(enabled=True, dry_run=False)
+
         self.assertEqual(0, self.github.commented)
 
     def test_multiple_uncommented_prs_fail_before_any_cloud_touch(self):
@@ -512,6 +593,28 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(0, self.github.created)
         self.assertEqual("2026-08-31T00:59:00+00:00", self.remote_state()["last_triggered_at"])
         self.assertEqual("refs/heads/main", git(self.remote, "for-each-ref", "--format=%(refname)"))
+
+    def test_recent_commented_pr_blocks_repairing_an_existing_canary(self):
+        self.initialize()
+        completed = "d" * 64
+        self.github.pages = [[
+            raw_pr(f"[codex-5h-touch] {completed}", f"trigger/{completed[:12]}",
+                   "2026-08-31T00:59:00Z", number=30),
+            raw_pr("[codex-5h-touch] canary-000000000000", "trigger/000000000000",
+                   "2026-08-31T00:58:00Z", number=31),
+        ]]
+        self.github.comment_pages[30] = [[raw_comment(
+            expected_comment(completed, "2026-08-31T00:59:00+00:00"))]]
+
+        self.assertEqual("skip", self.run_publish(
+            operation="canary", canary_approved=True, dry_run=False))
+
+        state = self.remote_state()
+        self.assertEqual(0, self.github.created)
+        self.assertEqual(0, self.github.commented)
+        self.assertIn(completed, state["handled_keys"])
+        self.assertNotIn("canary-000000000000", state["handled_keys"])
+        self.assertEqual("2026-08-31T00:59:00+00:00", state["last_triggered_at"])
 
     def test_uncommented_pr_arriving_before_canary_mutation_fails_closed(self):
         self.initialize()

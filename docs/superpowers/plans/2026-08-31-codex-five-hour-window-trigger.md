@@ -1032,7 +1032,7 @@ Run:
 rg -n "permissions:|contents: write|issues: write|pull-requests: write|GITHUB_TOKEN|github.token|OPENAI_API_KEY|PAT|eval |pull_request_target|cron:" .github codex_window_trigger README.md
 ```
 
-Expected: only the two intended write permissions and `github.token`; none of the forbidden secret names or unsafe constructs.
+Expected: only the three intended write permissions and `github.token`; none of the forbidden secret names or unsafe constructs.
 
 - [ ] **Step 3: Request code review and fix any findings**
 

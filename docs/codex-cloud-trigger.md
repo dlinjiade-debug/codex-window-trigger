@@ -27,6 +27,11 @@ exact comment authored by `github-actions[bot]`. It queries all comment pages,
 rechecks an uncertain create response, and persists state only after the PR and
 comment are both observable.
 
+Recovery first classifies every trusted PR without posting. If one PR lacks its
+exact comment, any other confirmed comment or persisted trigger inside the
+24-hour cooldown defers the repair; two missing comments fail closed. This keeps
+a recovery run from starting a second Cloud chat during the cooldown.
+
 ## Controlled canary
 
 The only canary identity is:
