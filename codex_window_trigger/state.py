@@ -41,7 +41,11 @@ def plan_transition(state: dict[str, Any], episode: Episode | None, *, eligible:
     handled.update(key for key, record in episodes.items() if record["status"] in _HANDLED_STATUSES)
 
     reconciled = _reconcile_existing_prs(episodes, handled, existing_prs)
-    newest_pr = max((_utc_datetime(value, "existing PR timestamp") for value in existing_prs.values()), default=None)
+    attempts = next_state.get("comment_attempts")
+    if attempts and any(key in existing_prs for key in attempts):
+        next_state.pop("comment_attempts")
+        reconciled = True
+    newest_pr = max((_utc_datetime(value, "confirmed touch timestamp") for value in existing_prs.values()), default=None)
     previous_last = _parse_optional_timestamp(next_state["last_triggered_at"], "last_triggered_at")
     effective_last = max((value for value in (previous_last, newest_pr) if value is not None), default=None)
     if effective_last is not None and next_state["last_triggered_at"] != effective_last.isoformat():
@@ -62,6 +66,9 @@ def plan_transition(state: dict[str, Any], episode: Episode | None, *, eligible:
         _finish(next_state, handled)
         return Transition("reconcile", "existing_pr", next_state)
 
+    if next_state.get("comment_attempts"):
+        _finish(next_state, handled)
+        return Transition("skip", "comment_attempt_pending", next_state)
     if not eligible or episode is None:
         _finish(next_state, handled)
         return Transition("skip", "ineligible_observation", next_state)
@@ -81,7 +88,7 @@ def plan_transition(state: dict[str, Any], episode: Episode | None, *, eligible:
 
 
 def _validate_state(state: object) -> None:
-    if not isinstance(state, dict) or set(state) - {"schema_version", "initialized", "last_triggered_at", "episodes", "handled_keys"}:
+    if not isinstance(state, dict) or set(state) - {"schema_version", "initialized", "last_triggered_at", "episodes", "handled_keys", "comment_attempts"}:
         raise ValueError("invalid state")
     if not {"schema_version", "initialized", "last_triggered_at", "episodes"}.issubset(state):
         raise ValueError("missing required state field")
@@ -102,6 +109,14 @@ def _validate_state(state: object) -> None:
         keys = state["handled_keys"]
         if not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys) or keys != sorted(set(keys)):
             raise ValueError("invalid handled keys")
+    if "comment_attempts" in state:
+        attempts = state["comment_attempts"]
+        if (not isinstance(attempts, dict) or len(attempts) > 1
+                or any(not isinstance(key, str) or not key or not isinstance(value, str)
+                       for key, value in attempts.items())):
+            raise ValueError("invalid comment attempts")
+        for value in attempts.values():
+            parse_utc(value)
 
 
 def _validate_existing_prs(existing_prs: object) -> None:
@@ -110,7 +125,7 @@ def _validate_existing_prs(existing_prs: object) -> None:
     for key, created_at in existing_prs.items():
         if not isinstance(key, str) or not key:
             raise ValueError("invalid PR key")
-        _utc_datetime(created_at, "existing PR timestamp")
+        _utc_datetime(created_at, "confirmed touch timestamp")
 
 
 def _utc_datetime(value: object, label: str) -> datetime:
@@ -134,10 +149,10 @@ def _record(episodes: dict[str, dict[str, str]], episode: Episode, status: str, 
 def _reconcile_existing_prs(episodes: dict[str, dict[str, str]], handled: set[str], existing_prs: dict[str, datetime]) -> bool:
     changed = False
     for key, created_at in existing_prs.items():
-        at = _utc_datetime(created_at, "existing PR timestamp").isoformat()
+        at = _utc_datetime(created_at, "confirmed touch timestamp").isoformat()
         current = episodes.get(key)
         # A previously reconciled record may have been trimmed. Its handled
-        # identity remains durable; the caller still considers every PR time
+        # identity remains durable; the caller still considers every touch time
         # when computing cooldown. Do not re-add and trim it on every poll.
         if current is None and key in handled:
             continue

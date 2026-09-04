@@ -68,7 +68,7 @@ class PlanTransitionTest(unittest.TestCase):
         self.assertEqual("trigger", result.action)
         self.assertEqual("triggered", result.next_state["episodes"]["b"]["status"])
 
-    def test_existing_pr_reconciles_and_uses_its_real_creation_time_for_cooldown(self):
+    def test_confirmed_touch_reconciles_and_uses_its_real_time_for_cooldown(self):
         state = {"schema_version": 1, "initialized": True, "last_triggered_at": None, "episodes": {}}
         existing = {"prior": T0 + timedelta(hours=3)}
 
@@ -79,7 +79,7 @@ class PlanTransitionTest(unittest.TestCase):
         self.assertEqual((T0 + timedelta(hours=3)).isoformat(), result.next_state["last_triggered_at"])
         self.assertEqual("pending", result.next_state["episodes"]["new"]["status"])
 
-    def test_existing_current_pr_reconciles_without_rewriting_its_timestamp(self):
+    def test_existing_confirmed_touch_reconciles_without_rewriting_its_timestamp(self):
         created_at = T0 + timedelta(hours=3)
         state = {"schema_version": 1, "initialized": True, "last_triggered_at": None, "episodes": {}}
         result = plan_transition(state, episode("b"), now=T0 + timedelta(hours=4), existing_prs={"b": created_at})
@@ -92,6 +92,48 @@ class PlanTransitionTest(unittest.TestCase):
         result = plan_transition(state, episode("c"), now=T0 + timedelta(hours=24), existing_prs={})
 
         self.assertEqual("trigger", result.action)
+
+    def test_comment_attempt_is_cleared_only_after_that_touch_is_confirmed(self):
+        state = {"schema_version": 1, "initialized": True, "last_triggered_at": None,
+                 "episodes": {}, "comment_attempts": {"a": T0.isoformat()}}
+
+        unrelated = plan_transition(
+            state, None, eligible=False, now=T0 + timedelta(minutes=1),
+            existing_prs={"b": T0 + timedelta(seconds=10)})
+        self.assertEqual({"a": T0.isoformat()}, unrelated.next_state["comment_attempts"])
+
+        confirmed = plan_transition(
+            unrelated.next_state, None, eligible=False, now=T0 + timedelta(minutes=2),
+            existing_prs={"a": T0 + timedelta(seconds=20)})
+        self.assertNotIn("comment_attempts", confirmed.next_state)
+        self.assertEqual(T0 + timedelta(seconds=20),
+                         datetime.fromisoformat(confirmed.next_state["last_triggered_at"]))
+
+    def test_comment_attempt_state_is_bounded_and_validated(self):
+        invalid_values = (
+            [],
+            {"": T0.isoformat()},
+            {"a": "not-a-time"},
+            {"a": T0.isoformat(), "b": T0.isoformat()},
+        )
+        for attempts in invalid_values:
+            with self.subTest(attempts=attempts):
+                state = {"schema_version": 1, "initialized": True,
+                         "last_triggered_at": None, "episodes": {},
+                         "comment_attempts": attempts}
+                with self.assertRaises(ValueError):
+                    plan_transition(state, None, eligible=False, now=T0, existing_prs={})
+
+    def test_unconfirmed_comment_attempt_blocks_planning_another_trigger(self):
+        state = {"schema_version": 1, "initialized": True, "last_triggered_at": None,
+                 "episodes": {}, "comment_attempts": {"a": T0.isoformat()}}
+
+        result = plan_transition(
+            state, episode("b"), now=T0 + timedelta(hours=25), existing_prs={})
+
+        self.assertEqual("skip", result.action)
+        self.assertEqual("comment_attempt_pending", result.reason)
+        self.assertNotIn("b", result.next_state["episodes"])
 
     def test_handled_keys_prevent_retrigger_after_episode_records_are_trimmed(self):
         episodes = {

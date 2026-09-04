@@ -5,8 +5,10 @@
 
 > 2026-09-04 实施修订：网页端事件任务无法在分配运行前表达全部可信过滤器，
 > 因此改为由同仓库 GitHub Actions 在可信 PR 后发布一条幂等、非评审
-> `@codex` 评论，直接启动 Codex Cloud chat。状态只有在 PR 与精确 bot 评论
-> 均可观察后才落盘；Cloud 环境无 secrets、关闭 internet，自动代码评审关闭。
+> `@codex` 评论，直接启动 Codex Cloud chat。成功触发状态只有在 PR 与精确
+> bot 评论经可信创建响应或列表确认后才落盘，并以评论 `created_at` 计算冷却；
+> POST 前可先落盘一个非成功收据的有界尝试标记，用于在响应丢失时禁止重复
+> POST。Cloud 环境无 secrets、关闭 internet，自动代码评审关闭。
 > 本修订取代下文关于 ChatGPT Web PR 事件监听器的交付描述。
 
 ## 1. 目标

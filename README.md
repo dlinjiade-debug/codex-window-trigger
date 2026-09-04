@@ -101,10 +101,11 @@ environment; local CLI planning by itself never publishes anything.
 The CLI stages only ignored `.runtime` files. The publisher queries all PR pages,
 pushes one deterministic `trigger/<12-hex>` branch, creates a literal-title PR,
 and posts a JSON-file-backed non-review `@codex` issue comment. Only after the
-trusted PR and exact bot-authored comment are both observable does it reconcile
-stored state against the PR's actual creation timestamp and commit state to the
-default branch. It never persists a trigger candidate as proof of success. PRs
-stay open.
+trusted PR and exact bot-authored comment are confirmed does it reconcile the
+trigger receipt against the comment's actual creation timestamp and commit it
+to the default branch. The PR creation time remains in the public receipt as
+provenance. It never persists a trigger candidate as proof of success. PRs stay
+open.
 
 A failed PR create leaves an immutable trigger commit to reuse. A later poll
 reuses the original payload, even if the new poll has a different receipt time;
@@ -115,6 +116,14 @@ the 24-hour cooldown from persisted state and every other confirmed comment. A
 recent confirmed touch defers that repair; more than one unacknowledged PR fails
 closed before any cloud touch. A failed state push is recovered from the
 observable PR/comment pair on the next fresh checkout.
+
+Immediately before the one comment POST, the publisher persists a bounded
+`comment_attempts` marker that is not a success receipt. A validated GitHub
+create response is authoritative even if list visibility lags. If the response
+is lost and the comment is still invisible, retries stay read-only until that
+exact comment appears; they never risk a duplicate automatic POST. If the
+attempt marker was written but no comment ever appears, an operator must inspect
+the PR before manually clearing the marker and retrying.
 Do not manually edit/rewrite trigger branches or automatically close them.
 
 Actions logs report the publisher outcome and a short public decision containing

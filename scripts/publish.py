@@ -5,6 +5,7 @@ persist a new plan only after observing both the trusted PR and its exact
 bot-authored Codex delegation comment.
 """
 import argparse
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta, timezone
 import json
 import os
@@ -162,12 +163,21 @@ def _pr_number(root, key):
     return numbers[key]
 
 
-def _plan(root, now, fixtures, dry_run):
+def _plan(root, now, fixtures, dry_run, confirmed=None):
     runtime = _safe_path(root, ".runtime")
     output = _safe_path(root, ".runtime/outputs.txt")
     output.write_text("", encoding="utf-8")
+    prs = runtime / "prs.json"
+    if confirmed is not None:
+        prs = runtime / "confirmed-prs.json"
+        write_json(prs, [
+            {"title": f"[codex-5h-touch] {key}",
+             "headRefName": f"trigger/{'000000000000' if key == _CANARY else key[:12]}",
+             "created_at": created_at.isoformat()}
+            for key, created_at in confirmed.items()
+        ])
     args = ["--state", str(_safe_path(root, "state/state.json")), "--runtime-dir", str(runtime),
-            "--prs", str(runtime / "prs.json"), "--now", now.isoformat(), "--github-output", str(output)]
+            "--prs", str(prs), "--now", now.isoformat(), "--github-output", str(output)]
     if fixtures is not None:
         if len(fixtures) != 3:
             raise ValueError("three fixture paths required")
@@ -201,7 +211,7 @@ def _persist(root, state, branch):
 
 
 def _canary_cooldown(state, existing, now):
-    """Reconcile trusted PRs and report whether their real time blocks canary."""
+    """Reconcile confirmed touches and report whether their real time blocks canary."""
     reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
     last = reconciled.next_state["last_triggered_at"]
     return reconciled.next_state, last is not None and now - parse_utc(last) < timedelta(hours=24)
@@ -254,11 +264,11 @@ def _comment(runtime, body):
     return path
 
 
-def _comment_exists(repository, number, expected, github):
+def _comment_time(repository, number, expected, github):
     pages = github.list_issue_comments(repository, number)
     if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         raise ValueError("expected all paginated comment pages")
-    matches = 0
+    matches = []
     for page in pages:
         for item in page:
             if not isinstance(item, dict):
@@ -267,25 +277,50 @@ def _comment_exists(repository, number, expected, github):
             if not isinstance(user, dict):
                 raise ValueError("invalid comment identity")
             if user.get("login") == "github-actions[bot]" and item.get("body") == expected:
-                matches += 1
-    if matches > 1:
+                try:
+                    matches.append(parse_utc(item.get("created_at")))
+                except ValueError as exc:
+                    raise ValueError("exact trigger comment timestamp is invalid") from exc
+    if len(matches) > 1:
         raise ValueError("duplicate exact trigger comments")
-    return matches == 1
+    return matches[0] if matches else None
+
+
+def _created_comment_time(value, expected):
+    if not isinstance(value, dict) or not isinstance(value.get("user"), dict):
+        raise ValueError("invalid created comment response")
+    if value["user"].get("login") != "github-actions[bot]" or value.get("body") != expected:
+        raise ValueError("created comment response does not match the trigger")
+    try:
+        return parse_utc(value.get("created_at"))
+    except ValueError as exc:
+        raise ValueError("created comment response timestamp is invalid") from exc
 
 
 def _ensure_comment(runtime, repository, number, key, created_at, github):
     expected = _comment_body(key, created_at)
-    if _comment_exists(repository, number, expected, github):
-        return False
+    observed = _comment_time(repository, number, expected, github)
+    if observed is not None:
+        return observed, False
     try:
-        github.create_issue_comment(repository, number, _comment(runtime, expected))
+        response = github.create_issue_comment(repository, number, _comment(runtime, expected))
     except (RuntimeError, subprocess.SubprocessError, OSError):
-        if not _comment_exists(repository, number, expected, github):
+        observed = _comment_time(repository, number, expected, github)
+        if observed is None:
             raise
+        return observed, True
     else:
-        if not _comment_exists(repository, number, expected, github):
-            raise RuntimeError("comment success is not yet observable; retry without persisting candidate")
-    return True
+        try:
+            created = _created_comment_time(response, expected)
+        except ValueError:
+            observed = _comment_time(repository, number, expected, github)
+            if observed is None:
+                raise
+            return observed, True
+        observed = _comment_time(repository, number, expected, github)
+        if observed is not None and observed != created:
+            raise ValueError("created comment timestamp does not match its listing")
+        return created, True
 
 
 def _handled_keys(state):
@@ -300,11 +335,11 @@ def _comment_status(root, repository, existing, handled, github):
     missing = []
     for key, created_at in existing.items():
         if key in handled:
-            confirmed[key] = created_at
             continue
         number = _pr_number(root, key)
-        if _comment_exists(repository, number, _comment_body(key, created_at), github):
-            confirmed[key] = created_at
+        touched_at = _comment_time(repository, number, _comment_body(key, created_at), github)
+        if touched_at is not None:
+            confirmed[key] = touched_at
         else:
             missing.append((key, created_at, number))
     if len(missing) > 1:
@@ -312,22 +347,31 @@ def _comment_status(root, repository, existing, handled, github):
     return confirmed, missing
 
 
-def _prepare_comments(root, runtime, repository, existing, handled, state, now,
-                      operation, github):
+def _prepare_comments(root, runtime, repository, branch, existing, handled, state,
+                      now, operation, github):
     confirmed, missing = _comment_status(root, repository, existing, handled, github)
+    transition = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
     if not missing:
-        return existing, False, None
+        if transition.next_state.get("comment_attempts"):
+            return confirmed, False, transition
+        return confirmed, False, None
     key, created_at, number = missing[0]
     if operation == "baseline":
         raise ValueError("baseline cannot acknowledge a trigger PR without a Codex comment")
     if operation == "canary" and key != _CANARY:
         raise ValueError("canary approval cannot repair a different trigger PR")
-    transition = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
+    if transition.next_state.get("comment_attempts"):
+        return confirmed, False, transition
     last = transition.next_state["last_triggered_at"]
     if last is not None and now - parse_utc(last) < timedelta(hours=24):
         return confirmed, False, transition
-    created = _ensure_comment(runtime, repository, number, key, created_at, github)
-    return existing, created, None
+    attempted = deepcopy(transition.next_state)
+    attempted["comment_attempts"] = {key: now.isoformat()}
+    _persist(root, attempted, branch)
+    touched_at, created = _ensure_comment(
+        runtime, repository, number, key, created_at, github)
+    confirmed[key] = touched_at
+    return confirmed, created, None
 
 
 def _remote_branch(root, branch):
@@ -418,8 +462,9 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     branch = _preflight(root, repository, github)
     runtime = _safe_path(root, ".runtime")
     runtime.mkdir(exist_ok=True)
-    for name in ("prs.json", "outputs.txt", "next-state.json", "trigger.json", "pr-title.txt",
-                 "pr-body.md", "codex-comment.json", "decision.json", "recovered-trigger.json"):
+    for name in ("prs.json", "confirmed-prs.json", "outputs.txt", "next-state.json",
+                 "trigger.json", "pr-title.txt", "pr-body.md", "codex-comment.json",
+                 "decision.json", "recovered-trigger.json"):
         _safe_path(root, f".runtime/{name}")
     now = parse_utc(now.isoformat()) if now is not None else datetime.now(UTC)
     state = read_json(_safe_path(root, "state/state.json"))
@@ -437,15 +482,15 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
         raise ValueError("canary requires initialized state")
     existing = _existing(root, repository, github)
     completed_canary = False
-    existing, repaired, blocked = _prepare_comments(
-        root, runtime, repository, existing, handled, state, now, operation, github)
+    confirmed, repaired, blocked = _prepare_comments(
+        root, runtime, repository, branch, existing, handled, state, now, operation, github)
     completed_canary = operation == "canary" and repaired
     if blocked is not None:
         _persist(root, blocked.next_state, branch)
         return "skip" if operation == "canary" else blocked.action
     if operation == "canary":
         if _CANARY in existing:
-            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
             _persist(root, reconciled.next_state, branch)
             return "canary" if completed_canary else "skip"
         payload = {"key": _CANARY, "event_id": _CANARY, "score": None, "target_at": None,
@@ -453,7 +498,7 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
                        "utc_plus_08": now.astimezone(timezone(timedelta(hours=8))).isoformat()}}
         trigger_branch = "trigger/000000000000"
     else:
-        outputs = _plan(root, now, fixtures, False)
+        outputs = _plan(root, now, fixtures, False, confirmed)
         action = outputs["action"]
         if operation == "baseline" and action not in {"baseline", "reconcile"}:
             raise ValueError("baseline must never trigger")
@@ -469,45 +514,45 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
     planned_existing = existing
     existing = _existing(root, repository, github)
     key = payload["key"]
-    existing, repaired, blocked = _prepare_comments(
-        root, runtime, repository, existing, handled, state, now, operation, github)
+    confirmed, repaired, blocked = _prepare_comments(
+        root, runtime, repository, branch, existing, handled, state, now, operation, github)
     completed_canary = completed_canary or (operation == "canary" and repaired)
     if blocked is not None:
         _persist(root, blocked.next_state, branch)
         return "skip" if operation == "canary" else blocked.action
     if operation == "canary":
         if _CANARY in existing:
-            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
             _persist(root, reconciled.next_state, branch)
             return "canary" if completed_canary else "skip"
-        reconciled_state, cooling_down = _canary_cooldown(state, existing, now)
+        reconciled_state, cooling_down = _canary_cooldown(state, confirmed, now)
         if cooling_down:
             _persist(root, reconciled_state, branch)
             return "skip"
     if operation == "poll" and existing != planned_existing:
-        reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+        reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
         _persist(root, reconciled.next_state, branch)
         return "reconcile"
     if key not in existing:
         payload = _ensure_branch(root, trigger_branch, payload, runtime)
         existing = _existing(root, repository, github)
-        existing, repaired, blocked = _prepare_comments(
-            root, runtime, repository, existing, handled, state, now, operation, github)
+        confirmed, repaired, blocked = _prepare_comments(
+            root, runtime, repository, branch, existing, handled, state, now, operation, github)
         completed_canary = completed_canary or (operation == "canary" and repaired)
         if blocked is not None:
             _persist(root, blocked.next_state, branch)
             return "skip" if operation == "canary" else blocked.action
         if operation == "canary":
             if _CANARY in existing:
-                reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+                reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
                 _persist(root, reconciled.next_state, branch)
                 return "canary" if completed_canary else "skip"
-            reconciled_state, cooling_down = _canary_cooldown(state, existing, now)
+            reconciled_state, cooling_down = _canary_cooldown(state, confirmed, now)
             if cooling_down:
                 _persist(root, reconciled_state, branch)
                 return "skip"
         if operation == "poll" and existing != planned_existing:
-            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+            reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
             _persist(root, reconciled.next_state, branch)
             return "reconcile"
         if key not in existing:
@@ -522,14 +567,15 @@ def publish(root, *, repository, event_name="workflow_dispatch", enabled=False,
                 existing = _existing(root, repository, github)
             if key not in existing:
                 raise RuntimeError("PR success is not yet observable; retry without persisting candidate")
-            existing, repaired, blocked = _prepare_comments(
-                root, runtime, repository, existing, handled, state, now, operation, github)
+            confirmed, repaired, blocked = _prepare_comments(
+                root, runtime, repository, branch, existing, handled, state, now, operation, github)
             completed_canary = completed_canary or (operation == "canary" and repaired)
             if blocked is not None:
                 _persist(root, blocked.next_state, branch)
                 return "skip" if operation == "canary" else blocked.action
-    _ensure_comment(runtime, repository, _pr_number(root, key), key, existing[key], github)
-    reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=existing)
+    if key not in confirmed:
+        raise RuntimeError("trigger comment is not confirmed")
+    reconciled = plan_transition(state, None, eligible=False, now=now, existing_prs=confirmed)
     _persist(root, reconciled.next_state, branch)
     return "canary" if operation == "canary" else "trigger"
 

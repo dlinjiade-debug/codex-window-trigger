@@ -24,13 +24,21 @@ key and the trusted PR creation time, tells Codex not to inspect files, run
 commands, modify the repository, create commits, or post follow-ups, and asks
 for the fixed short receipt before stopping. The publisher accepts only the
 exact comment authored by `github-actions[bot]`. It queries all comment pages,
-rechecks an uncertain create response, and persists state only after the PR and
-comment are both observable.
+validates the authenticated comment-create response, and rechecks an uncertain
+response. A successful receipt uses the comment's trusted `created_at` as the
+24-hour touch time; the PR time remains provenance in the comment body.
 
 Recovery first classifies every trusted PR without posting. If one PR lacks its
 exact comment, any other confirmed comment or persisted trigger inside the
 24-hour cooldown defers the repair; two missing comments fail closed. This keeps
 a recovery run from starting a second Cloud chat during the cooldown.
+
+Before its sole POST, the publisher commits a bounded `comment_attempts` marker.
+This marker is not a successful trigger receipt. If the POST response is lost
+and the exact comment is not yet listed, later runs remain read-only instead of
+posting again. Once the exact comment appears, reconciliation removes the marker.
+If it never appears, inspect the PR and clear the marker manually only after
+confirming that retrying cannot duplicate a Cloud touch.
 
 ## Controlled canary
 
