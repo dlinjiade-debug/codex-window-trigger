@@ -286,11 +286,19 @@ def _comment_time(repository, number, expected, github):
     return matches[0] if matches else None
 
 
-def _created_comment_time(value, expected):
+def _created_comment_time(value, expected, repository, number):
     if not isinstance(value, dict) or not isinstance(value.get("user"), dict):
         raise ValueError("invalid created comment response")
     if value["user"].get("login") != "github-actions[bot]" or value.get("body") != expected:
         raise ValueError("created comment response does not match the trigger")
+    comment_id = value.get("id")
+    if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
+        raise ValueError("created comment response ID is invalid")
+    api_root = f"https://api.github.com/repos/{repository}"
+    if value.get("issue_url") != f"{api_root}/issues/{number}":
+        raise ValueError("created comment response targets the wrong issue")
+    if value.get("url") != f"{api_root}/issues/comments/{comment_id}":
+        raise ValueError("created comment response URL does not match its ID")
     try:
         return parse_utc(value.get("created_at"))
     except ValueError as exc:
@@ -311,7 +319,7 @@ def _ensure_comment(runtime, repository, number, key, created_at, github):
         return observed, True
     else:
         try:
-            created = _created_comment_time(response, expected)
+            created = _created_comment_time(response, expected, repository, number)
         except ValueError:
             observed = _comment_time(repository, number, expected, github)
             if observed is None:

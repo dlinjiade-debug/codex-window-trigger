@@ -42,6 +42,7 @@ class FakeGitHub:
         self.comment_mode = "success"
         self.comment_list_mode = "success"
         self.comment_created_at = "2026-08-31T01:00:08Z"
+        self.comment_response = None
         self.created = 0
         self.commented = 0
         self.comment_pages = {}
@@ -83,12 +84,13 @@ class FakeGitHub:
         if set(value) != {"body"} or not isinstance(value["body"], str):
             raise AssertionError("comment transport must use one JSON body field")
         self.commented += 1
-        comment = raw_comment(value["body"], created_at=self.comment_created_at)
+        comment = raw_comment(value["body"], created_at=self.comment_created_at,
+                              number=number, comment_id=self.commented)
         if self.comment_mode not in {"delayed", "lost_delayed"}:
             self.comment_pages.setdefault(number, [[]])[-1].append(comment)
         if self.comment_mode in {"uncertain", "lost_delayed"}:
             raise RuntimeError("simulated lost comment response")
-        return deepcopy(comment)
+        return deepcopy(self.comment_response if self.comment_response is not None else comment)
 
 
 def raw_pr(title, branch, created_at, *, number=1, author="github-actions[bot]", head_repo=REPOSITORY):
@@ -97,13 +99,17 @@ def raw_pr(title, branch, created_at, *, number=1, author="github-actions[bot]",
             "base": {"ref": "main", "repo": {"full_name": REPOSITORY}}}
 
 
-def raw_comment(body, *, author="github-actions[bot]", created_at=None):
+def raw_comment(body, *, author="github-actions[bot]", created_at=None, number=1,
+                comment_id=1):
     if created_at is None:
         created_at = next(line.removeprefix("pr_created_utc=") for line in body.splitlines()
                           if line.startswith("pr_created_utc="))
-    return {"id": 1, "body": body, "user": {"login": author},
+    return {"id": comment_id, "body": body, "user": {"login": author},
             "created_at": created_at,
-            "html_url": f"https://github.com/{REPOSITORY}/pull/1#issuecomment-1"}
+            "url": f"https://api.github.com/repos/{REPOSITORY}/issues/comments/{comment_id}",
+            "html_url": (f"https://github.com/{REPOSITORY}/pull/{number}"
+                         f"#issuecomment-{comment_id}"),
+            "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/{number}"}
 
 
 def expected_comment(key, created_at):
@@ -435,6 +441,54 @@ class PublishTest(unittest.TestCase):
             now=datetime(2026, 8, 31, 1, 5, tzinfo=UTC)))
         self.assertEqual(1, self.github.created)
         self.assertEqual(1, self.github.commented)
+
+    def assert_unlisted_created_comment_response_rejected(self, response):
+        self.initialize()
+        self.github.comment_mode = "delayed"
+        self.github.comment_response = response
+
+        with self.assertRaises(ValueError):
+            self.run_publish(
+                operation="canary", canary_approved=True, dry_run=False)
+
+        state = self.remote_state()
+        self.assertEqual(
+            {"canary-000000000000": "2026-08-31T01:00:00+00:00"},
+            state["comment_attempts"])
+        self.assertNotIn("canary-000000000000", state.get("handled_keys", []))
+        self.assertIsNone(state["last_triggered_at"])
+        self.assertEqual(1, self.github.commented)
+
+    def test_created_comment_response_requires_positive_non_boolean_id(self):
+        response = raw_comment(
+            expected_comment(
+                "canary-000000000000", "2026-08-31T01:00:07+00:00"),
+            created_at=self.github.comment_created_at)
+        response["id"] = False
+
+        self.assert_unlisted_created_comment_response_rejected(response)
+
+    def test_misdirected_comment_response_requires_exact_listing_evidence(self):
+        response = raw_comment(
+            expected_comment(
+                "canary-000000000000", "2026-08-31T01:00:07+00:00"),
+            created_at=self.github.comment_created_at, comment_id=9)
+        response["issue_url"] = (
+            "https://api.github.com/repos/wrong/repository/issues/99")
+        response["url"] = (
+            "https://api.github.com/repos/wrong/repository/issues/comments/9")
+
+        self.assert_unlisted_created_comment_response_rejected(response)
+
+    def test_created_comment_response_url_must_match_its_id(self):
+        response = raw_comment(
+            expected_comment(
+                "canary-000000000000", "2026-08-31T01:00:07+00:00"),
+            created_at=self.github.comment_created_at, comment_id=9)
+        response["url"] = (
+            f"https://api.github.com/repos/{REPOSITORY}/issues/comments/8")
+
+        self.assert_unlisted_created_comment_response_rejected(response)
 
     def test_lost_response_stays_read_only_until_the_comment_is_visible(self):
         self.initialize()
